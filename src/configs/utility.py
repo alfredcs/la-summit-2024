@@ -15,6 +15,9 @@ from langchain_community.chat_models import BedrockChat
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+from langchain_core.runnables import RunnableParallel
+from langchain.prompts import ChatPromptTemplate
+
 
 config_filename = '.aoss_config.txt'
 suffix = random.randrange(200, 900)
@@ -395,6 +398,115 @@ def bedrock_kb_retrieval(query: str, model_id: str) -> str:
     generated_text = response['output']['text']
     return generated_text
 
+# --- Decomposition with fusion----
+def reciprocal_rank_fusion(results: list[list], k=60):
+    """ Reciprocal_rank_fusion that takes multiple lists of ranked documents 
+        and an optional parameter k used in the RRF formula """
+    
+    # Initialize a dictionary to hold fused scores for each unique document
+    fused_scores = {}
+
+    # Iterate through each list of ranked documents
+    for docs in results:
+        # Iterate through each document in the list, with its rank (position in the list)
+        for rank, doc in enumerate(docs):
+            # Convert the document to a string format to use as a key (assumes documents can be serialized to JSON)
+            doc_str = dumps(doc)
+            # If the document is not yet in the fused_scores dictionary, add it with an initial score of 0
+            if doc_str not in fused_scores:
+                fused_scores[doc_str] = 0
+            # Retrieve the current score of the document, if any
+            previous_score = fused_scores[doc_str]
+            # Update the score of the document using the RRF formula: 1 / (rank + k)
+            fused_scores[doc_str] += 1 / (rank + k)
+
+    # Sort the documents based on their fused scores in descending order to get the final reranked results
+    reranked_results = [
+        (loads(doc), score)
+        for doc, score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+    # Return the reranked results as a list of tuples, each containing the document and its fused score
+    return reranked_results
+    
+def retrieve_and_rag(retriever, chat_model, question, prompt_rag,sub_question_generator_chain):
+    """RAG on each sub-question"""
+
+    # Use our decomposition / 
+    sub_questions = sub_question_generator_chain.invoke({"question":question})
+    
+    # Initialize a list to hold RAG chain results
+    rag_results = []
+    
+    for sub_question in sub_questions:
+        
+        # Retrieve documents for each sub-question
+        retrieved_docs = retriever.get_relevant_documents(sub_question)
+        
+        # Use retrieved documents and sub-question in RAG chain
+        answer = (prompt_rag | chat_model| StrOutputParser()).invoke({"context": retrieved_docs, 
+                                                                "question": sub_question})
+        rag_results.append(answer)
+    
+        return rag_results,sub_questions
+
+def format_qa_pairs(questions, answers):
+    """Format Qa and A pairs"""
+    
+    formatted_string = ""
+    for i, (question, answer) in enumerate(zip(questions, answers), start=1):
+        formatted_string += f"Question {i}: {question}\nAnswer {i}: {answer}\n\n"
+    return formatted_string.strip()
+        
+def bedrock_kb_retrieval_decomposition(query: str, model_id: str, max_tokens: int, temperature:float, top_p:float, top_k:int, stop_sequences:str) -> str:
+    kb_id = read_key_value(config_filename, 'KB_id')
+    prompt_template = hub.pull("rlm/rag-prompt")
+    model_kwargs =  { 
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_k": top_k,
+        "top_p": top_p,
+        "stop_sequences":[stop_sequences],
+    }
+    chat_claude_v3 = BedrockChat(model_id=model_id, model_kwargs=model_kwargs)
+
+    retriever = AmazonKnowledgeBasesRetriever(
+        knowledge_base_id=kb_id,
+        retrieval_config={"vectorSearchConfiguration": {"numberOfResults": 8}},
+    )
+
+    # RAG-Fusion: Related
+    # Decomposition
+    template = """You are a helpful assistant that generates multiple sub-questions related to an input question. \n
+    The goal is to break down the input into a set of sub-problems / sub-questions that can be answers in isolation. \n
+    Generate multiple search queries semantically related to: {question} \n
+    Output (6 queries):"""
+    prompt_decomposition = ChatPromptTemplate.from_template(template)
+    generate_queries_decomposition = ( prompt_decomposition | chat_claude_v3 | StrOutputParser() | (lambda x: x.split("\n")))
+    questions = generate_queries_decomposition.invoke({"question":query})
+    # Wrap the retrieval and RAG process in a RunnableLambda for integration into a chain
+    answers, questions = retrieve_and_rag(retriever, chat_claude_v3, query, prompt_template, generate_queries_decomposition)
+    context = format_qa_pairs(questions, answers)
+
+    # Now retrieval
+        # Prompt
+    template = """Here is a set of Q+A pairs:
+    
+    {context}
+    
+    Use these to synthesize an answer to the question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    final_rag_chain = (
+        prompt
+        | chat_claude_v3
+        | StrOutputParser()
+    )
+    
+    return final_rag_chain.invoke({"context":context,"question":query})
+
+
+# ----- Retrieval -----
 def bedrock_kb_retrieval_advanced(query: str, model_id: str, max_tokens: int, temperature:float, top_p:float, top_k:int, stop_sequences:str) -> str:
     kb_id = read_key_value(config_filename, 'KB_id')
     prompt_template = hub.pull("rlm/rag-prompt")
@@ -425,7 +537,8 @@ def bedrock_kb_retrieval_advanced(query: str, model_id: str, max_tokens: int, te
     
     
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        #{"context": retriever | format_docs, "question": RunnablePassthrough()}
+        RunnableParallel(context = retriever | format_docs, question = RunnablePassthrough() )
         | prompt_template
         | chat_claude_v3
         | StrOutputParser()

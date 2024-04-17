@@ -9,9 +9,10 @@ for module_path in module_paths:
     sys.path.append(os.path.abspath(module_path))
 
 from utility import *
+from utils import *
 
-st.set_page_config(page_title="MM-RAG Demo",page_icon="🩺",layout="wide")
-st.title("Multimodal RAG Demo")
+st.set_page_config(page_title="Advanced RAG",page_icon="🩺",layout="wide")
+st.title("Advanced RAG Demo")
 
 aoss_host = read_key_value(".aoss_config.txt", "AOSS_host_name")
 aoss_index = read_key_value(".aoss_config.txt", "AOSS_index_name")
@@ -21,13 +22,17 @@ aoss_index = read_key_value(".aoss_config.txt", "AOSS_index_name")
 #@st.cache_resource(TTL=300)
 with st.sidebar:
     #----- RAG  ------ 
-    st.header(':green[Multimodal RAG] :file_folder:')
-    rag_update = rag_retrieval = False
+    st.header(':green[Search RAG] :file_folder:')
+    rag_search = rag_update = rag_retrieval = False
     rag_on = st.select_slider(
         'Activate RAG',
         value='None',
-        options=['None', 'Update', 'Retrieval'])
-    if 'Update' in rag_on:
+        options=['None', 'Search', 'Local', 'Retrieval'])
+    if 'Search' in rag_on:
+        doc_num = st.slider('Choose max number of documents', 1, 8, 3)
+        embedding_model_id = st.selectbox('Choose Embedding Model',('amazon.titan-embed-g1-text-02', 'amazon.titan-embed-image-v1'))
+        rag_search = True
+    elif 'Local' in rag_on:
         upload_docs = st.file_uploader("Upload your doc here", accept_multiple_files=True, type=['pdf', 'doc', 'jpg', 'png'])
         # Amazon Bedrock KB only supports titan-embed-text-v1 not g1-text-02
         embedding_model_id = st.selectbox('Choose Embedding Model',('amazon.amazon.titan-embed-text-v1', 'amazon.titan-embed-image-v1'))
@@ -37,7 +42,7 @@ with st.sidebar:
                 
     #----- Choose models  ------ 
     st.divider()
-    st.title(':orange[Multimodal Config] :pencil2:') 
+    st.title(':orange[Model Config] :pencil2:') 
     option = st.selectbox('Choose Model',('anthropic.claude-3-haiku-20240307-v1:0', 
                                           'anthropic.claude-3-sonnet-20240229-v1:0', 
                                           'anthropic.claude-instant-v1',
@@ -73,7 +78,22 @@ for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
 #
-if rag_update:
+if rag_search:
+    if prompt := st.chat_input():
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+        
+        #Do retrieval
+        #documents = search_and_convert(prompt, max_results=doc_num, filepath='pdfs')
+        #documents = search_arxiv(prompt, max_results=doc_num, filepath='pdfs')
+        documents, urls = google_search(prompt, num_results=doc_num)
+        msg = retrieval_faiss(prompt, documents, option, embedding_model_id, 6000, 600, max_token, temperature, top_p, top_k, doc_num)
+        msg += "\n\n ✧ Sources:\n\n" + '\n\n\r'.join(urls)
+        msg += "\n\n ✒︎ Content created by using: " + option
+        st.session_state.messages.append({"role": "assistant", "content": msg})
+        st.chat_message("ai", avatar='🦙').write(msg)
+        
+elif rag_update:        
     # Update AOSS
     if upload_docs:
         empty_directory(file_path)
@@ -93,8 +113,9 @@ elif rag_retrieval:
         st.chat_message("user").write(prompt)
         
         #Do retrieval
-        #msg = bedrock_kb_retrieval(prompt, option)
-        msg = bedrock_kb_retrieval_advanced(prompt, option, max_token, temperature, top_p, top_k, stop_sequences)
+        msg = bedrock_kb_retrieval(prompt, option)
+        #msg = bedrock_kb_retrieval_advanced(prompt, option, max_token, temperature, top_p, top_k, stop_sequences)
+        #msg = bedrock_kb_retrieval_decomposition(prompt, option, max_token, temperature, top_p, top_k, stop_sequences)
         msg += "\n\n ✒︎Content created by using: " + option
         st.session_state.messages.append({"role": "assistant", "content": msg})
         st.chat_message("ai", avatar='🦙').write(msg)

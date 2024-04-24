@@ -603,6 +603,20 @@ def bedrock_textGen(model_id, prompt, max_tokens, temperature, top_p, top_k, sto
         response_body = response['body'].read().decode('utf-8')
         data = json.loads(response_body)
         return data['content'][0]['text']
+    elif 'meta' in model_id.lower():
+        inference_modifier = {
+            "max_gen_len": max_tokens,
+            "temperature": temperature,
+            #"top_k": top_k,
+            "top_p": top_p,
+            #"stop_sequences": stop_sequence,
+        }
     
+        textgen_llm = Bedrock(
+            model_id=model_id,
+            client=bedrock_client,
+            model_kwargs=inference_modifier,
+        )     
+        return textgen_llm(prompt)
     else:
         return f"Incorrect Bedrock model ID {model_id.lower()} selected!"

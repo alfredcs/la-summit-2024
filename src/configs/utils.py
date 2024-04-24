@@ -3,18 +3,21 @@ from langchain_core.documents.base import Document
 import requests
 import os
 import boto3
+import json
 import multiprocessing
 from bs4 import BeautifulSoup
 import requests # Required to make HTTP requests
 from bs4 import BeautifulSoup  # Required to parse HTML
 from urllib.parse import unquote # Required to unquote URLs
 from xml.etree import ElementTree
+from botocore.exceptions import ClientError
+
 
 from operator import itemgetter
 from langchain import hub
 from langchain_community.embeddings import BedrockEmbeddings
 from langchain_community.chat_models import BedrockChat
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain.prompts.chat import ChatPromptTemplate
@@ -27,6 +30,18 @@ from langchain_community.vectorstores import FAISS
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import FlashrankRerank
 # To address  RuntimeError: maximum recursion depth exceeded
+
+#from langchain_community.llms import HuggingFaceTextGenInference
+from langchain_community.llms.huggingface_text_gen_inference import (
+    HuggingFaceTextGenInference,
+)
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+
+# For TGI textGen
+from langchain.chains import LLMChain
+#from langchain_community.llms import TextGen
+from langchain_core.prompts import PromptTemplate
+
 import sys   
 sys.setrecursionlimit(10000)
 
@@ -52,7 +67,6 @@ def google_search(query: str, num_results: int=5):
         try:
             # Send a GET request to the URL
             response = requests.get(item['link'])
-            print(f"Before:{item['link']}")
             # Parse the HTML content using BeautifulSoup
             soup = BeautifulSoup(response.content, 'html.parser')
             # Extract the text content from the HTML
@@ -60,7 +74,6 @@ def google_search(query: str, num_results: int=5):
             if "404 Not Found" not in content:
                 # Create a LangChain document
                 doc = Document(page_content=content, metadata={'title': item['title'],'source': item['link']})
-                print(f"After: {item['link']}")
                 documents.append(doc)
                 urls. append(item['link'])
     
@@ -269,7 +282,8 @@ def search_arxiv(query:str, max_results=10, filepath: str='pdfs'):
 
 # ---- 
 def retrieval_faiss(query, documents, model_id, embedding_model_id:str, chunk_size:int=6000, over_lap:int=600, max_tokens: int=2048, temperature: int=0.01, top_p: float=0.90, top_k: int=25, doc_num: int=3):
-    text_splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=over_lap)
+    #text_splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=over_lap)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=over_lap, length_function=len, is_separator_regex=False,)
     docs = text_splitter.split_documents(documents)
     
     # Prepare embedding function
@@ -309,3 +323,247 @@ def retrieval_faiss(query, documents, model_id, embedding_model_id:str, chunk_si
 
     results = rag_chain.invoke(query)
     return results
+
+def tgi_textGen(option, prompt, max_token, temperature, top_p, top_k):
+    try:
+        llm = HuggingFaceTextGenInference(
+            inference_server_url=option,
+            max_new_tokens=max_token,
+            top_k=top_k,
+            top_p=top_p,
+            typical_p=top_p,
+            truncate=None,
+            #callbacks=callbacks,
+            streaming=True,
+            watermark=False,
+            temperature=temperature,
+            repetition_penalty=1.03,
+        )
+    except Excepption as err:
+        print(f"An error occurred in tgi_textGen: {err}")
+
+    c_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a professional programmer who can write Python codes based on the user input."),
+        ("user", "{input}")
+    ])
+    output_parser = StrOutputParser()
+    chain = c_prompt | llm | output_parser
+    output = chain.invoke({"input": prompt})
+    return output.strip().replace('Assistant:', '')
+
+def tgi_textGen2(option, question, max_token, temperature, top_p, top_k):
+    try:
+        llm = HuggingFaceTextGenInference(
+            inference_server_url=option,
+            max_new_tokens=max_token,
+            top_k=top_k,
+            top_p=top_p,
+            typical_p=top_p,
+            truncate=None,
+            callbacks=[StreamingStdOutCallbackHandler()],
+            streaming=False,
+            watermark=False,
+            temperature=temperature,
+            repetition_penalty=1.03,
+        )
+    except Excepption as err:
+        print(f"An error occurred in tgi_textGen: {err}")
+        
+    #template = """Question: {question}
+    #Answer: Let's think first and answer the question with your best effort with comprehensive and accurate info."""
+    
+    template = """
+                Assistant:You are a world class assistant. Please think first and answer the {question} with comprehensive and accurate info in text format.
+                Question:{question}
+                Answer:
+               """
+    
+    prompt = PromptTemplate.from_template(template)
+
+    
+    llm_chain = LLMChain(prompt=prompt, llm=llm)
+    
+    return llm_chain.run(question)
+
+
+# ------ Classification ----
+def classify_query(query, classes: str, modelId: str):
+    """
+    Classify a query into 'Tech', 'Health', or 'General' using an LLM.
+
+    :param query: The query string to classify.
+    :param openai_api_key: Your OpenAI API key.
+    :return: A string classification: 'Tech', 'Health', or 'General'.
+    """
+    bedrock_client = boto3.client('bedrock-runtime')
+    
+    # Constructing the prompt for the LLM
+    prompt = f"Human:Classify the following query into one of these categories: {classes}.\n\nQuery: {query}\n\n Please answer directly with the catergory name only. \n\n  AI:"
+    payload = {
+            "modelId": modelId,
+            "contentType": "application/json",
+            "accept": "application/json",
+            "body": {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 4096,
+                "temperature": 0.01,
+                "top_k": 250,
+                "top_p": 0.95,
+                #"stop_sequences": stop_sequence,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    try:
+        # Convert the payload to bytes
+        body_bytes = json.dumps(payload['body']).encode('utf-8')
+        # Invoke the model
+        response = bedrock_client.invoke_model(
+            body=body_bytes,
+            contentType=payload['contentType'],
+            accept=payload['accept'],
+            modelId=payload['modelId']
+        )
+
+
+        #response = bedrock_client.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
+        response_body = json.loads(response.get('body').read())
+        classification = ''.join([item['text'] for item in response_body['content'] if item.get('type') == 'text'])
+        # Assuming the most likely category is returned directly as the output text
+        #classification = response.choices[0].text.strip()
+        return classification
+    except Exception as e:
+        print(f"Error classifying query: {e}")
+        return "Error"
+
+# ---- Image gen --------
+def image_to_base64(img) -> str:
+    """Converts a PIL Image or local image file path to a base64 string"""
+    if isinstance(img, str):
+        if os.path.isfile(img):
+            print(f"Reading image from file: {img}")
+            with open(img, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        else:
+            raise FileNotFoundError(f"File {img} does not exist")
+    elif isinstance(img, Image.Image):
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    else:
+        raise ValueError(f"Expected str (filename) or PIL Image. Got {type(img)}")
+
+def bedrock_imageGen(model_id:str, prompt:str, iheight:int, iwidth:int, src_image, image_quality:str, image_n:int, cfg:float, seed:int):
+    negative_prompts = [
+                "poorly rendered",
+                "poor background details",
+                "poorly drawn objects",
+                "poorly focused objects",
+                "disfigured object features",
+                "cartoon",
+                "animation"
+            ]
+    titan_negative_prompts = ','.join(negative_prompts)
+    #try:
+    if model_id == "amazon.titan-image-generator-v1":
+        if cfg > 10.0:
+           cfg = 10.0
+        if src_image:
+            src_img_b64 = image_to_base64(src_image)
+            body = json.dumps(
+                {
+                    "taskType": "IMAGE_VARIATION",
+                    "imageVariationParams": {
+                        "text":prompt,   # Required
+                        "negativeText": titan_negative_prompts,  # Optional
+                        "images": [src_img_b64]
+                    },
+                    "imageGenerationConfig": {
+                        "numberOfImages": image_n,   # Range: 1 to 5 
+                        "quality": image_quality,  # Options: standard or premium
+                        "height": iheight,         # Supported height list in the docs 
+                        "width": iwidth,         # Supported width list in the docs
+                        "cfgScale": cfg,       # Range: 1.0 (exclusive) to 10.0
+                        "seed": seed             # Range: 0 to 214783647
+                    }
+                }
+            )
+        else:
+            body = json.dumps(
+                {
+                    "taskType": "TEXT_IMAGE",
+                    "textToImageParams": {
+                        "text":prompt,   # Required
+                        "negativeText": titan_negative_prompts  # Optional
+                    },
+                    "imageGenerationConfig": {
+                        "numberOfImages": image_n,   # Range: 1 to 5 
+                        "quality": image_quality,  # Options: standard or premium
+                        "height": iheight,         # Supported height list in the docs 
+                        "width": iwidth,         # Supported width list in the docs
+                        "cfgScale": cfg,       # Range: 1.0 (exclusive) to 10.0
+                        "seed": seed             # Range: 0 to 214783647
+                    }
+                }
+            )
+    elif model_id == "stability.stable-diffusion-xl-v1:0":
+        style_preset = "photographic"  # (e.g. photographic, digital-art, cinematic, ...)
+        clip_guidance_preset = "FAST_GREEN" # (e.g. FAST_BLUE FAST_GREEN NONE SIMPLE SLOW SLOWER SLOWEST)
+        sampler = "K_DPMPP_2S_ANCESTRAL" # (e.g. DDIM, DDPM, K_DPMPP_SDE, K_DPMPP_2M, K_DPMPP_2S_ANCESTRAL, K_DPM_2, K_DPM_2_ANCESTRAL, K_EULER, K_EULER_ANCESTRAL, K_HEUN, K_LMS)
+        if src_image:
+            src_img_b64 = image_to_base64(src_image)
+            body = json.dumps({
+                "text_prompts": (
+                        [{"text": prompt, "weight": 1.0}]
+                        + [{"text": negprompt, "weight": -1.0} for negprompt in negative_prompts]
+                    ),
+                "cfg_scale": cfg,
+                "seed": seed,
+                "steps": 60,
+                "style_preset": style_preset,
+                "clip_guidance_preset": clip_guidance_preset,
+                "sampler": sampler,
+                "width": iwidth,
+                "init_image": src_img_b64,
+            })
+        else:
+            body = json.dumps({
+                "text_prompts": (
+                        [{"text": prompt, "weight": 1.0}]
+                        + [{"text": negprompt, "weight": -1.0} for negprompt in negative_prompts]
+                    ),
+                "cfg_scale": cfg,
+                "seed": seed,
+                "steps": 60,
+                "style_preset": style_preset,
+                "clip_guidance_preset": clip_guidance_preset,
+                "sampler": sampler,
+                "width": iwidth,
+            })
+    bedrock_client = boto3.client("bedrock-runtime",  region_name="us-west-2")
+    response = bedrock_client.invoke_model(
+        body=body, 
+        modelId=model_id,
+        accept="application/json", 
+        contentType="application/json"
+    )
+    response_body = json.loads(response["body"].read())
+    if model_id == "amazon.titan-image-generator-v1":
+        base64_image_data = response_body["images"][0]
+    elif model_id == "stability.stable-diffusion-xl-v1:0":
+        base64_image_data = response_body["artifacts"][0].get("base64")
+
+    return base64_image_data
+
+    #except ClientError:
+    #    logger.error("Couldn't invoke Titan Image Generator Model")
+    #    raise

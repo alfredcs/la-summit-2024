@@ -1,6 +1,10 @@
 import streamlit as st
 import sys
 import os
+import io
+from PIL import Image
+from io import BytesIO
+import base64
 
 module_paths = ["./", "./configs"]
 file_path = "./data/"
@@ -44,11 +48,11 @@ with st.sidebar:
     st.divider()
     st.title(':orange[Model Config] :pencil2:') 
     option = st.selectbox('Choose Model',('anthropic.claude-3-haiku-20240307-v1:0', 
-                                          'anthropic.claude-3-sonnet-20240229-v1:0', 
-                                          'anthropic.claude-instant-v1',
-                                          'anthropic.claude-v2:1'))
-
-
+                                          'anthropic.claude-3-sonnet-20240229-v1:0',
+                                          'anthropic.claude-3-opus-20240229-v1:0',
+                                          'meta.llama3-70b-instruct-v1:0',
+                                          'llama-3-8b-instruct'))
+        
     st.write("------- Default parameters ----------")
     temperature = st.number_input("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
     max_token = st.number_input("Maximum Output Token", min_value=0, value=1024, step=64)
@@ -92,7 +96,7 @@ if rag_search:
         msg += "\n\n ✒︎ Content created by using: " + option
         st.session_state.messages.append({"role": "assistant", "content": msg})
         st.chat_message("ai", avatar='🦙').write(msg)
-        
+
 elif rag_update:        
     # Update AOSS
     if upload_docs:
@@ -124,8 +128,16 @@ else:
     if prompt := st.chat_input():
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-
-        msg=bedrock_textGen(option, prompt, max_token, temperature, top_p, top_k, stop_sequences)
+        if 'llama-3-8b-instruct' in option.lower():
+            msg=tgi_textGen2('http://rad.cavatar.info:7861', prompt, max_token, temperature, top_p, top_k)
+        elif 'generate image' in classify_query(prompt, 'generate image, news, else', 'anthropic.claude-3-haiku-20240307-v1:0'):
+            option = 'amazon.titan-image-generator-v1' #'stability.stable-diffusion-xl-v1:0' # Or 'amazon.titan-image-generator-v1'
+            base64_str = bedrock_imageGen(option, prompt, iheight=1024, iwidth=1024, src_image=None, image_quality='premium', image_n=1, cfg=7.5, seed=452345)
+            new_image = Image.open(io.BytesIO(base64.decodebytes(bytes(base64_str, "utf-8"))))
+            st.image(new_image,width=512)#use_column_width='auto')
+            msg = ' '
+        else:
+            msg=bedrock_textGen(option, prompt, max_token, temperature, top_p, top_k, stop_sequences)
         msg += "\n\n ✒︎Content created by using: " + option
         st.session_state.messages.append({"role": "assistant", "content": msg})
         st.chat_message("ai", avatar='🦙').write(msg)

@@ -4,6 +4,8 @@ import requests
 import os
 import boto3
 import json
+import re
+import string
 import multiprocessing
 from bs4 import BeautifulSoup
 import requests # Required to make HTTP requests
@@ -23,10 +25,15 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain.prompts.chat import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel
 #from langchain.utilities import GoogleSearchAPIWrapper
+from langchain.retrievers.web_research import WebResearchRetriever
 from langchain_community.utilities import GoogleSearchAPIWrapper
 from readabilipy import simple_json_from_html_string # Required to parse HTML to pure text
+from langchain.agents import AgentExecutor, create_react_agent, initialize_agent, AgentType,load_tools
+from langchain_community.utilities.serpapi import SerpAPIWrapper
+from serpapi import GoogleSearch #, BingSearch
 
 from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import FlashrankRerank
 # To address  RuntimeError: maximum recursion depth exceeded
@@ -56,16 +63,35 @@ def scrape_and_parse(url: str) -> Document:
     # return Document(page_content=article['plain_text'][0]['text'], metadata={'source': url, 'page_title': article['title']})
     return Document(page_content='\n\n'.join([a['text'] for a in article['plain_text']]), metadata={'source': url, 'page_title': article['title']})
 
-
+def extract_keywords(input_string):
+    # Remove punctuation and convert to lowercase
+    input_string = input_string.translate(str.maketrans('', '', string.punctuation)).lower()
+    # Split the string into words
+    words = input_string.split()
+    # Define a regular expression pattern to match web searchable keywords
+    pattern = r'^[a-z0-9]+$'
+    # Filter out non-keyword words
+    keywords = [word for word in words if re.match(pattern, word)]
+    # Join the keywords with '+'
+    output_string = '+'.join(keywords)
+    return output_string
+    
 # Saerch google and bing with a query and return urls
 def google_search(query: str, num_results: int=5):
-    google_search = GoogleSearchAPIWrapper(google_api_key=os.getenv("google_api_key"), google_cse_id=os.getenv("google_cse_id"))
-    google_results = google_search.results(query, num_results=num_results)
+    gsearch = GoogleSearchAPIWrapper(google_api_key=os.getenv("google_api_key"), google_cse_id=os.getenv("google_cse_id"))
+    params = {
+        "num_results": num_results,  # Number of results to return
+        #"exclude": "youtube.com"  # Exclude results from YouTube
+    }
+    google_results = gsearch.results(extract_keywords(query), **params)
+    #google_results = gsearch.results(query, num_results=num_results)
     documents = []
     urls = []
     for item in google_results:
         try:
             # Send a GET request to the URL
+            if ('link' not in item) or('youtube' in item['link'].lower()):
+                continue
             response = requests.get(item['link'])
             # Parse the HTML content using BeautifulSoup
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -293,11 +319,12 @@ def retrieval_faiss(query, documents, model_id, embedding_model_id:str, chunk_si
     db = FAISS.from_documents(docs, embedding)
     retriever = db.as_retriever(search_kwargs={"k": doc_num})
 
+
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
     messages = [
-        ("system", """Your are a helpful assistant to provide omprehensive and truthful answers to questions, \n
+        ("system", """Your are a helpful assistant to provide comprehensive and truthful answers to questions, \n
                     drawing upon all relevant information contained within the specified in {context}. \n 
                     You add value by analyzing the situation and offering insights to enrich your answer. \n
                     Simply say I don't know if you can not find any evidence to match the question. \n
@@ -323,6 +350,53 @@ def retrieval_faiss(query, documents, model_id, embedding_model_id:str, chunk_si
 
     results = rag_chain.invoke(query)
     return results
+
+def retrieval_chroma(query, model_id, embedding_model_id:str, chunk_size:int=6000, over_lap:int=600, max_tokens: int=2048, temperature: int=0.01, top_p: float=0.90, top_k: int=25, doc_num: int=3):
+
+    # LLM   and  embedding function
+    chat, embedding = config_bedrock(embedding_model_id, model_id, max_tokens, temperature, top_p, top_k)
+    # Define on-memeory vector store
+    vectorstore = Chroma(embedding_function=embedding)    
+    # Search
+    search = GoogleSearchAPIWrapper(google_api_key=os.getenv("google_api_key"), google_cse_id=os.getenv("google_cse_id"))
+    # Initialize
+    web_research_retriever = WebResearchRetriever.from_llm(
+        vectorstore=vectorstore, llm=chat, search=search
+    )
+
+    # Form retrievl chain
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    messages = [
+        ("system", """Your are a helpful assistant to provide omprehensive and truthful answers to questions, \n
+                    drawing upon all relevant information contained within the specified in {context}. \n 
+                    You add value by analyzing the situation and offering insights to enrich your answer. \n
+                    Simply say I don't know if you can not find any evidence to match the question. \n
+                    Display the source urls with clicable hyperlinks at the end of your answer.
+                    """),
+        #MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ]
+    prompt_template = ChatPromptTemplate.from_messages(messages)
+    
+    # Reranker
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor= FlashrankRerank(), base_retriever=web_research_retriever
+    )
+    
+    rag_chain = (
+        #{"context": compression_retriever | format_docs, "question": RunnablePassthrough()}
+        #| RunnableParallel(answer=hub.pull("rlm/rag-prompt") | chat |format_docs, question=itemgetter("question") ) 
+        RunnableParallel(context=compression_retriever | format_docs, question=RunnablePassthrough() )
+        | prompt_template
+        | chat
+        | StrOutputParser()
+    )
+
+    results = rag_chain.invoke(query)
+    return results
+    
 
 def tgi_textGen(option, prompt, max_token, temperature, top_p, top_k):
     try:
@@ -364,7 +438,7 @@ def tgi_textGen2(option, question, max_token, temperature, top_p, top_k):
             streaming=False,
             watermark=False,
             temperature=temperature,
-            repetition_penalty=1.03,
+            repetition_penalty=1.13,
         )
     except Excepption as err:
         print(f"An error occurred in tgi_textGen: {err}")
@@ -373,7 +447,7 @@ def tgi_textGen2(option, question, max_token, temperature, top_p, top_k):
     #Answer: Let's think first and answer the question with your best effort with comprehensive and accurate info."""
     
     template = """
-                Assistant:You are a world class assistant. Please think first and answer the {question} with comprehensive and accurate info in text format.
+                Assistant:You are a world class assistant. Please think first and answer the {question} with comprehensive and accurate info.
                 Question:{question}
                 Answer:
                """
@@ -567,3 +641,38 @@ def bedrock_imageGen(model_id:str, prompt:str, iheight:int, iwidth:int, src_imag
     #except ClientError:
     #    logger.error("Couldn't invoke Titan Image Generator Model")
     #    raise
+
+#------------ Retrivel from serpapi search -----
+def serp_search(query, model_id, embedding_model_id:str, max_tokens: int=2048, temperature: int=0.01, top_p: float=0.90, top_k: int=40,  doc_num: int=3):
+    
+    # Get the API token and prompt to use - you can modify this!
+    prompt = hub.pull("hwchase17/react")
+    os.environ['SERPAPI_API_KEY'] = os.getenv('serp_api_token')
+    
+    # Choose the LLM to use
+    llm, embedding = config_bedrock(embedding_model_id, model_id, max_tokens, temperature, top_p, top_k)
+    
+    # Set up tools
+    #tool1 = [TavilySearchResults(max_results=3, api_wrapper=tavily_search)]
+    tool2 = load_tools(["serpapi"], llm=llm)
+    
+    # Construct the ReAct agent
+    agent = create_react_agent(llm, tool2, prompt)
+    
+    # Create an agent executor by passing in the agent and tools
+    agent_executor = AgentExecutor(agent=agent, tools=tool2, verbose=True, handle_parsing_errors=True)
+    results = agent_executor.invoke({"input": query})
+
+    # Get urls
+    params = {"engine": "google", "q": query, "api_key": os.getenv("serp_api_token"), "num_results": doc_num}
+    goog_search = GoogleSearch(params)
+    data = goog_search.get_dict()
+    urls = []
+    for i in range(doc_num+1):
+        url = data['organic_results'][i]['link']
+        if 'youtube.com' not in url:
+            print(url)
+            urls.append(url)
+
+    return results['output'], urls
+        

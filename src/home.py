@@ -31,12 +31,12 @@ with st.sidebar:
     rag_on = st.select_slider(
         'Activate RAG',
         value='None',
-        options=['None', 'Search', 'Local', 'Retrieval'])
+        options=['None', 'Search', 'Insert', 'Retrieval'])
     if 'Search' in rag_on:
         doc_num = st.slider('Choose max number of documents', 1, 8, 3)
         embedding_model_id = st.selectbox('Choose Embedding Model',('amazon.titan-embed-g1-text-02', 'amazon.titan-embed-image-v1'))
         rag_search = True
-    elif 'Local' in rag_on:
+    elif 'Insert' in rag_on:
         upload_docs = st.file_uploader("Upload your doc here", accept_multiple_files=True, type=['pdf', 'doc', 'jpg', 'png'])
         # Amazon Bedrock KB only supports titan-embed-text-v1 not g1-text-02
         embedding_model_id = st.selectbox('Choose Embedding Model',('amazon.amazon.titan-embed-text-v1', 'amazon.titan-embed-image-v1'))
@@ -47,11 +47,16 @@ with st.sidebar:
     #----- Choose models  ------ 
     st.divider()
     st.title(':orange[Model Config] :pencil2:') 
-    option = st.selectbox('Choose Model',('anthropic.claude-3-haiku-20240307-v1:0', 
-                                          'anthropic.claude-3-sonnet-20240229-v1:0',
-                                          'anthropic.claude-3-opus-20240229-v1:0',
-                                          'meta.llama3-70b-instruct-v1:0',
-                                          'llama-3-8b-instruct'))
+    if 'Search' in rag_on:
+        option = st.selectbox('Choose Model',('anthropic.claude-3-haiku-20240307-v1:0', 
+                                              'anthropic.claude-3-sonnet-20240229-v1:0'
+                                             ))
+    else:
+        option = st.selectbox('Choose Model',('anthropic.claude-3-haiku-20240307-v1:0', 
+                                              'anthropic.claude-3-sonnet-20240229-v1:0',
+                                              'anthropic.claude-3-opus-20240229-v1:0',
+                                              'meta.llama3-70b-instruct-v1:0',
+                                              'finetuned:llama-3-8b-instruct'))
         
     st.write("------- Default parameters ----------")
     temperature = st.number_input("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
@@ -90,8 +95,10 @@ if rag_search:
         #Do retrieval
         #documents = search_and_convert(prompt, max_results=doc_num, filepath='pdfs')
         #documents = search_arxiv(prompt, max_results=doc_num, filepath='pdfs')
+        #msg = retrieval_chroma(prompt, option, embedding_model_id, 6000, 600, max_token, temperature, top_p, top_k, doc_num
         documents, urls = google_search(prompt, num_results=doc_num)
         msg = retrieval_faiss(prompt, documents, option, embedding_model_id, 6000, 600, max_token, temperature, top_p, top_k, doc_num)
+        #msg, urls = serp_search(prompt, option, embedding_model_id, max_token, temperature, top_p, top_k, doc_num)
         msg += "\n\n ✧ Sources:\n\n" + '\n\n\r'.join(urls)
         msg += "\n\n ✒︎ Content created by using: " + option
         st.session_state.messages.append({"role": "assistant", "content": msg})
@@ -129,8 +136,8 @@ else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         if 'llama-3-8b-instruct' in option.lower():
-            msg=tgi_textGen2('http://rad.cavatar.info:7861', prompt, max_token, temperature, top_p, top_k)
-        elif 'generate image' in classify_query(prompt, 'generate image, news, else', 'anthropic.claude-3-haiku-20240307-v1:0'):
+            msg=tgi_textGen2('http://infs.cavatar.info:7861/', prompt, max_token, temperature, top_p, top_k)
+        elif 'generate image' in classify_query(prompt, 'generate image, news, others', 'anthropic.claude-3-haiku-20240307-v1:0'):
             option = 'amazon.titan-image-generator-v1' #'stability.stable-diffusion-xl-v1:0' # Or 'amazon.titan-image-generator-v1'
             base64_str = bedrock_imageGen(option, prompt, iheight=1024, iwidth=1024, src_image=None, image_quality='premium', image_n=1, cfg=7.5, seed=452345)
             new_image = Image.open(io.BytesIO(base64.decodebytes(bytes(base64_str, "utf-8"))))
